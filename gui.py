@@ -23,6 +23,7 @@ DEFAULT_CONFIG = {
         "between_runs_seconds": [15, 45],
     },
     "browser": {"randomize_fingerprint": True},
+    "debug_on_error": True,
 }
 
 
@@ -68,6 +69,13 @@ class App:
             settings,
             text='Каждый раз новый "отпечаток" браузера (User-Agent, экран, часовой пояс)',
             variable=self.vars["randomize_fingerprint"],
+        ).pack(anchor="w", padx=8, pady=(0, 2))
+
+        self.vars["debug_on_error"] = tk.BooleanVar()
+        ttk.Checkbutton(
+            settings,
+            text="Сохранять скриншот и HTML страницы в папку debug/ при ошибке",
+            variable=self.vars["debug_on_error"],
         ).pack(anchor="w", padx=8, pady=(0, 8))
 
         delays = ttk.LabelFrame(self.root, text="Задержки, секунды (мин / макс)")
@@ -158,6 +166,7 @@ class App:
 
         browser = config.get("browser", {})
         self.vars["randomize_fingerprint"].set(bool(browser.get("randomize_fingerprint", True)))
+        self.vars["debug_on_error"].set(bool(config.get("debug_on_error", True)))
 
     def _read_fields_into_config(self) -> dict:
         def as_float(key: str, field_label: str) -> float:
@@ -207,6 +216,7 @@ class App:
                 ),
             },
             "browser": {"randomize_fingerprint": bool(self.vars["randomize_fingerprint"].get())},
+            "debug_on_error": bool(self.vars["debug_on_error"].get()),
         }
 
     # ---------- actions ----------

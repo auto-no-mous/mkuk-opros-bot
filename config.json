@@ -1,7 +1,7 @@
 {
   "survey_url": "https://sigmapro.givc.ru/index.php?r=survey/index&sid=256238&lang=ru&orgcode=125160254",
   "runs": 20,
-  "headless": true,
+  "headless": false,
   "delays": {
     "page_change_seconds": [
       10.0,
@@ -18,5 +18,6 @@
   },
   "browser": {
     "randomize_fingerprint": true
-  }
+  },
+  "debug_on_error": true
 }

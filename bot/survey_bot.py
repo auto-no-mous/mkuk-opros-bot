@@ -131,7 +131,8 @@ def run_once(browser, config: dict, run_number: int, log) -> None:
     try:
         complete_survey(page, config)
     except Exception:
-        _dump_debug_snapshot(page, run_number, log)
+        if config.get("debug_on_error", True):
+            _dump_debug_snapshot(page, run_number, log)
         raise
     finally:
         context.close()
