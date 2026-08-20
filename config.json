@@ -1,0 +1,22 @@
+{
+  "survey_url": "https://sigmapro.givc.ru/index.php?r=survey/index&sid=256238&lang=ru&orgcode=125160254",
+  "runs": 20,
+  "headless": true,
+  "delays": {
+    "page_change_seconds": [
+      10.0,
+      30.0
+    ],
+    "before_submit_seconds": [
+      5.0,
+      10.0
+    ],
+    "between_runs_seconds": [
+      15.0,
+      45.0
+    ]
+  },
+  "browser": {
+    "randomize_fingerprint": true
+  }
+}
