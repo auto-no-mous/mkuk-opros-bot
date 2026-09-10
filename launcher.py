@@ -1,11 +1,13 @@
-"""Launcher: checks Python version, installs dependencies if needed, then starts the survey bot."""
-import importlib.util
+"""Launcher: checks that this Python can run the bot, then starts it.
+
+The bot uses only the Python standard library, so there is nothing to download
+or install here -- this exists to turn the two things that can still go wrong
+(too old a Python, a build without tkinter) into a readable message.
+"""
 import subprocess
 import sys
-from pathlib import Path
 
 MIN_PYTHON = (3, 9)
-ROOT = Path(__file__).resolve().parent
 
 
 def setup_console_encoding() -> None:
@@ -49,45 +51,9 @@ def check_python_version() -> None:
         )
 
 
-def is_installed(module_name: str) -> bool:
-    return importlib.util.find_spec(module_name) is not None
-
-
-def pip_install(requirements_file: Path) -> None:
-    print("Устанавливаю зависимости Python (это может занять пару минут)...")
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-r", str(requirements_file)],
-        cwd=str(ROOT),
-    )
-    if result.returncode != 0:
-        fail(
-            "Не удалось установить зависимости Python через pip.\n"
-            "Проверьте подключение к интернету и попробуйте запустить заново."
-        )
-
-
-def install_playwright_browser() -> None:
-    print("Проверяю/устанавливаю браузер Chromium для Playwright...")
-    result = subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        cwd=str(ROOT),
-    )
-    if result.returncode != 0:
-        fail(
-            "Не удалось установить браузер Chromium для Playwright.\n"
-            "Проверьте подключение к интернету и попробуйте запустить заново."
-        )
-
-
 def main() -> None:
     setup_console_encoding()
     check_python_version()
-
-    requirements_file = ROOT / "requirements.txt"
-    if not is_installed("playwright"):
-        pip_install(requirements_file)
-
-    install_playwright_browser()
 
     try:
         import gui

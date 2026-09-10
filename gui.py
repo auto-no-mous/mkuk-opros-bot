@@ -8,7 +8,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
-from bot import survey_bot
+from bot import preview, survey_bot
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
@@ -16,23 +16,30 @@ CONFIG_PATH = ROOT / "config.json"
 DEFAULT_CONFIG = {
     "survey_url": "",
     "runs": 0,
-    "headless": False,
     "delays": {
         "page_change_seconds": [10, 30],
         "before_submit_seconds": [5, 10],
         "between_runs_seconds": [15, 45],
     },
-    "browser": {"randomize_fingerprint": True},
+    "requests": {"randomize_fingerprint": True},
+    "engine": "http",
+    "browser": {"channel": "auto", "headless": False},
     "debug_on_error": True,
 }
+
+ENGINE_LABELS = {
+    "http": "HTTP — без зависимостей (для рабочих машин)",
+    "browser": "Браузер — Playwright (чтобы смотреть глазами)",
+}
+LABEL_TO_ENGINE = {label: engine for engine, label in ENGINE_LABELS.items()}
 
 
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Бот для прохождения опросов МКУК, для клубов, ДК")
-        self.root.geometry("560x560")
-        self.root.minsize(480, 460)
+        self.root.geometry("620x560")
+        self.root.minsize(560, 460)
 
         self.log_queue: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -59,22 +66,28 @@ class App:
         self.vars["runs"] = tk.StringVar()
         self._add_entry(settings, "Число прохождений (0 = без ограничений):", "runs", width=10)
 
-        self.vars["headless"] = tk.BooleanVar()
-        ttk.Checkbutton(
-            settings, text="Скрывать окно браузера (headless)", variable=self.vars["headless"]
-        ).pack(anchor="w", padx=8, pady=(2, 2))
+        self.vars["engine"] = tk.StringVar()
+        engine_row = ttk.Frame(settings)
+        engine_row.pack(fill="x", padx=8, pady=4)
+        ttk.Label(engine_row, text="Чем проходить опрос:", width=42).pack(side="left")
+        ttk.Combobox(
+            engine_row,
+            textvariable=self.vars["engine"],
+            values=list(ENGINE_LABELS.values()),
+            state="readonly",
+        ).pack(side="left", fill="x", expand=True)
 
         self.vars["randomize_fingerprint"] = tk.BooleanVar()
         ttk.Checkbutton(
             settings,
-            text='Каждый раз новый "отпечаток" браузера (User-Agent, экран, часовой пояс)',
+            text='Каждый раз новый "отпечаток" (User-Agent, язык, заголовки запроса)',
             variable=self.vars["randomize_fingerprint"],
-        ).pack(anchor="w", padx=8, pady=(0, 2))
+        ).pack(anchor="w", padx=8, pady=(2, 2))
 
         self.vars["debug_on_error"] = tk.BooleanVar()
         ttk.Checkbutton(
             settings,
-            text="Сохранять скриншот и HTML страницы в папку debug/ при ошибке",
+            text="Сохранять HTML страницы в папку debug/ при ошибке",
             variable=self.vars["debug_on_error"],
         ).pack(anchor="w", padx=8, pady=(0, 8))
 
@@ -102,6 +115,9 @@ class App:
         self.stop_button = ttk.Button(controls, text="Остановить", command=self._on_stop, state="disabled")
         self.stop_button.pack(side="left", padx=(8, 0))
 
+        self.check_button = ttk.Button(controls, text="Проверить", command=self._on_check)
+        self.check_button.pack(side="left", padx=(8, 0))
+
         self.status_var = tk.StringVar(value="Не запущен")
         ttk.Label(controls, textvariable=self.status_var).pack(side="left", padx=(16, 0))
 
@@ -125,13 +141,13 @@ class App:
     def _add_entry(self, parent: ttk.LabelFrame, label: str, key: str, width: int = 30) -> None:
         row = ttk.Frame(parent)
         row.pack(fill="x", padx=8, pady=4)
-        ttk.Label(row, text=label, width=38).pack(side="left")
+        ttk.Label(row, text=label, width=42).pack(side="left")
         ttk.Entry(row, textvariable=self.vars[key], width=width).pack(side="left", fill="x", expand=True)
 
     def _add_range(self, parent: ttk.LabelFrame, label: str, min_key: str, max_key: str) -> None:
         row = ttk.Frame(parent)
         row.pack(fill="x", padx=8, pady=4)
-        ttk.Label(row, text=label, width=28).pack(side="left")
+        ttk.Label(row, text=label, width=32).pack(side="left")
         ttk.Entry(row, textvariable=self.vars[min_key], width=8).pack(side="left")
         ttk.Label(row, text=" – ").pack(side="left")
         ttk.Entry(row, textvariable=self.vars[max_key], width=8).pack(side="left")
@@ -149,9 +165,15 @@ class App:
                     f"Не удалось прочитать config.json, использую значения по умолчанию.\n{exc}",
                 )
 
+        # Kept so that saving the form does not drop settings it has no field for
+        # (browser channel, headless).
+        self.extra_config = {"browser": config.get("browser", DEFAULT_CONFIG["browser"])}
+
+        self.vars["engine"].set(
+            ENGINE_LABELS.get(config.get("engine", "http"), ENGINE_LABELS["http"])
+        )
         self.vars["survey_url"].set(config.get("survey_url", ""))
         self.vars["runs"].set(str(config.get("runs", 0)))
-        self.vars["headless"].set(bool(config.get("headless", False)))
 
         delays = config.get("delays", DEFAULT_CONFIG["delays"])
         page_change = delays.get("page_change_seconds", [10, 30])
@@ -164,8 +186,9 @@ class App:
         self.vars["between_runs_min"].set(between_runs[0])
         self.vars["between_runs_max"].set(between_runs[1])
 
-        browser = config.get("browser", {})
-        self.vars["randomize_fingerprint"].set(bool(browser.get("randomize_fingerprint", True)))
+        # "browser" is what the setting was called back when the bot drove Chromium.
+        requests_config = config.get("requests", config.get("browser", {}))
+        self.vars["randomize_fingerprint"].set(bool(requests_config.get("randomize_fingerprint", True)))
         self.vars["debug_on_error"].set(bool(config.get("debug_on_error", True)))
 
     def _read_fields_into_config(self) -> dict:
@@ -203,7 +226,6 @@ class App:
         return {
             "survey_url": url,
             "runs": runs,
-            "headless": bool(self.vars["headless"].get()),
             "delays": {
                 "page_change_seconds": as_range(
                     "page_change_min", "page_change_max", "Между сменой страниц"
@@ -215,7 +237,9 @@ class App:
                     "between_runs_min", "between_runs_max", "Между прохождениями опроса"
                 ),
             },
-            "browser": {"randomize_fingerprint": bool(self.vars["randomize_fingerprint"].get())},
+            "requests": {"randomize_fingerprint": bool(self.vars["randomize_fingerprint"].get())},
+            "engine": LABEL_TO_ENGINE.get(self.vars["engine"].get(), "http"),
+            "browser": self.extra_config["browser"],
             "debug_on_error": bool(self.vars["debug_on_error"].get()),
         }
 
@@ -227,8 +251,7 @@ class App:
             messagebox.showerror("Проверьте настройки", str(exc))
             return
 
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
+        self._save_config(config)
 
         self.ok_count = 0
         self.error_count = 0
@@ -243,6 +266,49 @@ class App:
 
         self.bot_thread = threading.Thread(target=self._run_bot, daemon=True)
         self.bot_thread.start()
+
+    def _on_check(self) -> None:
+        """One pass of the survey with a report of every answer chosen."""
+        if not messagebox.askyesno(
+            "Проверка",
+            "Бот пройдёт опрос один раз и откроет отчёт о том, какие ответы он выбрал."
+            + (
+                "\n\nВыбран браузерный режим — откроется окно браузера, и опрос пройдёт в нём."
+                if LABEL_TO_ENGINE.get(self.vars["engine"].get()) == "browser"
+                else ""
+            )
+            + "\n\nОпрос при этом будет отправлен по-настоящему: отличить последнюю "
+            "страницу заранее нельзя, так что пройти его «вхолостую» не получится."
+            + "\n\nПродолжить?",
+        ):
+            return
+
+        try:
+            config = self._read_fields_into_config()
+        except ValueError as exc:
+            messagebox.showerror("Проверьте настройки", str(exc))
+            return
+        self._save_config(config)
+
+        self._clear_log()
+        self.stop_event = threading.Event()
+        self.check_button.configure(state="disabled")
+        self.start_button.configure(state="disabled")
+        self.status_var.set("Проверка...")
+
+        self.bot_thread = threading.Thread(target=self._run_check, daemon=True)
+        self.bot_thread.start()
+
+    def _run_check(self) -> None:
+        try:
+            preview.run_check(
+                log=lambda msg: self.log_queue.put(("log", msg)),
+                stop_event=self.stop_event,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log_queue.put(("log", f"Проверка аварийно завершилась: {exc}"))
+        finally:
+            self.log_queue.put(("finished", None))
 
     def _run_bot(self) -> None:
         try:
@@ -259,7 +325,7 @@ class App:
     def _on_stop(self) -> None:
         self.stop_event.set()
         self.stop_button.configure(state="disabled")
-        self._append_log("Останавливаю бота (после текущего прохождения)...")
+        self._append_log("Останавливаю бота — текущее прохождение не будет отправлено...")
 
     def _on_close(self) -> None:
         if self.bot_thread and self.bot_thread.is_alive():
@@ -269,9 +335,14 @@ class App:
         self.root.destroy()
 
     # ---------- helpers ----------
+    def _save_config(self, config: dict) -> None:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+
     def _set_running_state(self, running: bool) -> None:
         self.start_button.configure(state="disabled" if running else "normal")
         self.stop_button.configure(state="normal" if running else "disabled")
+        self.check_button.configure(state="disabled" if running else "normal")
         self.status_var.set("Работает..." if running else "Остановлен")
 
     def _append_log(self, text: str) -> None:

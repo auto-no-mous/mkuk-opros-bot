@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 debug/
 pages/
+preview/
+vendor/
