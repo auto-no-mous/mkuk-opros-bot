@@ -1,21 +1,42 @@
-"""Core automation loop: launches an isolated browser profile per run and walks through the survey."""
+"""Core automation loop: walks through the survey over plain HTTP, one fresh session per run."""
 import json
 import random
 import threading
 import time
 from pathlib import Path
 
-from playwright.sync_api import Locator, Page, sync_playwright
-
 from bot import rules
-from bot.profile import random_context_options
+from bot.page import SurveyPage
+from bot.profile import default_headers, random_headers
+from bot.session import NetworkError, Session
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "config.json"
 
+# A survey page that keeps returning without ever completing would otherwise
+# loop forever; no LimeSurvey questionnaire is anywhere near this long.
+MAX_STEPS = 30
+
 # Replaced with the caller's Event (if any) at the start of run(); lets sleep_range()
-# react to a Stop request immediately instead of finishing out a long delay first.
+# and the page loop react to a Stop request immediately, instead of finishing out a
+# long delay -- or a whole survey -- first.
 _stop_event = threading.Event()
+
+
+class SurveyError(RuntimeError):
+    """The survey did not go the way the rules expect."""
+
+
+class BrowserUnavailable(RuntimeError):
+    """The optional browser engine could not be started.
+
+    Defined here rather than in `browser_bot` so that this module can catch it
+    without importing Playwright's side of the project.
+    """
+
+
+def uses_browser(config: dict) -> bool:
+    return config.get("engine") == "browser"
 
 
 def load_config() -> dict:
@@ -28,125 +49,162 @@ def sleep_range(bounds: list) -> None:
     _stop_event.wait(duration)
 
 
-def _click_and_wait(page: Page, selector: str, delays: dict) -> None:
-    with page.expect_navigation():
-        page.click(selector)
-    sleep_range(delays["page_change_seconds"])
+def _choose_single_choice(question) -> list:
+    options = question.options()
+    if not options:
+        return []
 
-
-def _click_next(page: Page, delays: dict) -> None:
-    _click_and_wait(page, "#ls-button-submit", delays)
-
-
-def _select(radio_input: Locator) -> None:
-    """Selects a radio option the way a real user would.
-
-    Some answer styles (e.g. the gender buttons) hide the native input behind
-    Bootstrap's `.btn-check` (pointer-events: none), so clicking the input itself
-    doesn't register -- the visible <label> has to be clicked instead. Other
-    styles (matrix table cells) hide the label and only the input is clickable.
-    """
-    page = radio_input.page
-    input_id = radio_input.get_attribute("id")
-    label = page.locator(f"label[for='{input_id}']")
-    if label.count() > 0 and label.first.is_visible():
-        label.first.click(force=True)
-    else:
-        radio_input.check(force=True)
-
-
-def _answer_single_choice(question: Locator) -> None:
-    text = question.locator(".question-text").inner_text().strip()
-    fixed_answer = rules.find_fixed_answer(text)
-
+    fixed_answer = rules.find_fixed_answer(question.text)
     if fixed_answer is not None:
-        label = question.locator("label", has_text=fixed_answer).first
-        input_id = label.get_attribute("for")
-        _select(question.page.locator(f"#{input_id}"))
-        return
+        chosen = rules.match_option(options, fixed_answer)
+        if chosen is None:
+            raise SurveyError(
+                f'Не нашёл вариант ответа «{fixed_answer}» в вопросе «{question.text[:80]}»'
+            )
+    else:
+        chosen = random.choice(options)
+    return [chosen]
 
-    radios = question.locator("input[type='radio']")
-    _select(radios.nth(random.randrange(radios.count())))
 
-
-def _answer_matrix(question: Locator) -> None:
-    rows = question.locator("table tbody tr")
-    row_count = rows.count()
-    for i in range(row_count):
-        row = rows.nth(i)
-        radios = row.locator("input[type='radio']")
-        if i == row_count - 1:
+def _choose_matrix(question) -> list:
+    chosen = []
+    rows = question.matrix_rows()
+    for index, row in enumerate(rows):
+        if index == len(rows) - 1:
             column = random.choice(rules.MATRIX_LAST_ROW_COLUMNS)
         else:
             column = rules.MATRIX_DEFAULT_COLUMN
-        _select(radios.nth(column))
+        # Guard against a shorter row than the rules assume, so a reworded
+        # survey degrades to "last available column" instead of crashing.
+        chosen.append(row[min(column, len(row) - 1)])
+    return chosen
 
 
-def answer_question_page(page: Page) -> None:
-    questions = page.locator(".question-container")
-    for i in range(questions.count()):
-        question = questions.nth(i)
-        if question.locator("table").count() > 0:
-            _answer_matrix(question)
-        else:
-            _answer_single_choice(question)
+def choose_for_question(question) -> list:
+    """The option(s) the rules pick for one question.
+
+    Kept separate from the posting of the form so that the check mode can watch
+    a real run make its decisions rather than reimplementing the rules.
+    """
+    if question.is_matrix:
+        return _choose_matrix(question)
+    return _choose_single_choice(question)
 
 
-def complete_survey(page: Page, config: dict) -> None:
+def answer_question_page(page: SurveyPage, fields: dict, on_decision=None) -> None:
+    for question in page.questions():
+        chosen = choose_for_question(question)
+        for option in chosen:
+            fields[option.name] = option.value
+        if on_decision:
+            on_decision(question, chosen)
+
+
+def complete_survey(session: Session, config: dict, on_page=None, on_decision=None) -> bool:
+    """Walks one full pass of the survey.
+
+    Returns True once the survey's completion page is reached, or False if a stop
+    was requested part-way -- in that case nothing further is submitted, so the
+    half-filled run does not reach the site at all.
+
+    on_page: called with every page as it is loaded, so a caller can keep hold of
+        the last one for the debug snapshot when something goes wrong.
+    on_decision: called with (question, chosen_options) for every question answered,
+        which is how the check mode reports what the rules picked.
+    """
     delays = config["delays"]
-    page.goto(config["survey_url"])
+
+    def load(page_response) -> SurveyPage:
+        page = SurveyPage(page_response.url, page_response.html)
+        if on_page:
+            on_page(page)
+        return page
+
+    page = load(session.get(config["survey_url"]))
     sleep_range(delays["page_change_seconds"])
 
-    while True:
-        if page.locator(".completed-wrapper").count() > 0:
-            return
-        if page.locator(".ap-org-welcome-button").count() > 0:
+    for _ in range(MAX_STEPS):
+        if _stop_event.is_set():
+            return False
+        if page.is_completed:
+            return True
+
+        gate_url = page.org_gate_url
+        if gate_url is not None:
             # Organization confirmation gate ("Вы оставляете оценку деятельности...").
             # Shown on every fresh session since it isn't part of the LimeSurvey engine itself.
-            _click_and_wait(page, ".ap-org-welcome-button", delays)
+            page = load(session.get(gate_url, referer=page.url))
+            sleep_range(delays["page_change_seconds"])
             continue
-        if page.locator("#welcome-container").count() == 0:
-            answer_question_page(page)
+
+        if not page.has_form:
+            raise SurveyError("На странице опроса нет формы — возможно, сайт вернул что-то неожиданное")
+
+        fields = page.base_fields()
+        if not page.is_welcome:
+            answer_question_page(page, fields, on_decision=on_decision)
+        fields["move"] = page.submit_move
+
         sleep_range(delays["before_submit_seconds"])
-        _click_next(page, delays)
+        if _stop_event.is_set():
+            return False
+        page = load(session.post(page.action_url, fields, referer=page.url))
+
+        rejected = page.rejected_questions()
+        if rejected:
+            raise SurveyError("Сайт не принял ответы на вопросы: " + "; ".join(rejected))
+
+        sleep_range(delays["page_change_seconds"])
+
+    raise SurveyError(f"Опрос не завершился за {MAX_STEPS} шагов — похоже, бот застрял на одной странице")
 
 
-def _dump_debug_snapshot(page: Page, run_number: int, log) -> None:
+def _dump_debug_snapshot(page: SurveyPage, run_number: int, log) -> None:
     debug_dir = ROOT / "debug"
     debug_dir.mkdir(exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    base = debug_dir / f"run{run_number}_{stamp}"
+    target = debug_dir / f"run{run_number}_{stamp}.html"
     try:
-        page.screenshot(path=str(base) + ".png", full_page=True)
-        (base.with_suffix(".html")).write_text(page.content(), encoding="utf-8")
-        log(f"Сохранил скриншот и HTML страницы, на которой произошла ошибка: {base}.png / {base}.html")
-    except Exception as exc:  # noqa: BLE001
+        target.write_text(page.html, encoding="utf-8")
+        log(f"Сохранил HTML страницы, на которой произошла ошибка: {target}")
+    except OSError as exc:
         log(f"Не удалось сохранить отладочный снимок страницы: {exc}")
 
 
-def run_once(browser, config: dict, run_number: int, log) -> None:
-    context_options = random_context_options() if config["browser"]["randomize_fingerprint"] else {}
-    context = browser.new_context(**context_options)
-    page = context.new_page()
+def session_for(config: dict) -> Session:
+    randomize = config.get("requests", {}).get("randomize_fingerprint", True)
+    return Session(random_headers() if randomize else default_headers())
+
+
+def run_once(config: dict, run_number: int, log) -> bool:
+    seen = {}
+
+    def remember(page) -> None:
+        seen["page"] = page
+
     try:
-        complete_survey(page, config)
+        if uses_browser(config):
+            from bot import browser_bot
+
+            return browser_bot.run_once(config, run_number, log, on_page=remember)
+        return complete_survey(session_for(config), config, on_page=remember)
     except Exception:
-        if config.get("debug_on_error", True):
-            _dump_debug_snapshot(page, run_number, log)
+        if config.get("debug_on_error", True) and "page" in seen:
+            _dump_debug_snapshot(seen["page"], run_number, log)
         raise
-    finally:
-        context.close()
 
 
 def run(stop_event: threading.Event = None, log=print, on_run_done=None) -> None:
     """Runs the bot loop.
 
-    stop_event: when set, the loop stops after the current in-progress survey run
-        (and skips the remaining between-runs delay) instead of finishing all `runs`.
+    stop_event: when set, the current run is abandoned without submitting the page
+        it was filling in, any remaining delay is skipped, and the loop ends.
     log: called with a str message for every progress update; defaults to print()
         for plain CLI usage, but a GUI can pass something that pushes to a queue.
-    on_run_done: called with (run_number, success: bool) after each attempt, for
-        callers that want structured progress instead of parsing log text.
+    on_run_done: called with (run_number, success: bool) after each run that either
+        finished or failed, for callers that want structured progress instead of
+        parsing log text. A run abandoned on `stop_event` is not reported: it
+        neither reached the site nor went wrong.
     """
     global _stop_event
     _stop_event = stop_event or threading.Event()
@@ -154,27 +212,31 @@ def run(stop_event: threading.Event = None, log=print, on_run_done=None) -> None
     config = load_config()
     runs = config.get("runs", 0)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=config.get("headless", False))
+    count = 0
+    while (runs == 0 or count < runs) and not _stop_event.is_set():
+        count += 1
+        log(f"--- Прохождение опроса #{count} ---")
+        success = True
+        finished = True
         try:
-            count = 0
-            while (runs == 0 or count < runs) and not _stop_event.is_set():
-                count += 1
-                log(f"--- Прохождение опроса #{count} ---")
-                success = True
-                try:
-                    run_once(browser, config, count, log)
-                    log(f"Опрос #{count} пройден успешно.")
-                except Exception as exc:  # noqa: BLE001
-                    success = False
-                    log(f"Ошибка при прохождении опроса #{count}: {exc}")
-                if on_run_done:
-                    on_run_done(count, success)
-                if (runs == 0 or count < runs) and not _stop_event.is_set():
-                    sleep_range(config["delays"]["between_runs_seconds"])
-            log("Бот остановлен." if _stop_event.is_set() else "Бот завершил все прохождения.")
-        finally:
-            browser.close()
+            finished = run_once(config, count, log)
+            if finished:
+                log(f"Опрос #{count} пройден успешно.")
+            else:
+                log(f"Прохождение #{count} прервано — ответ не отправлен.")
+        except (SurveyError, NetworkError, BrowserUnavailable) as exc:
+            success = False
+            log(f"Ошибка при прохождении опроса #{count}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            success = False
+            log(f"Непредвиденная ошибка при прохождении опроса #{count}: {exc}")
+        # An interrupted run is neither a success nor a failure, so it is left
+        # out of the counters entirely.
+        if on_run_done and (finished or not success):
+            on_run_done(count, success)
+        if (runs == 0 or count < runs) and not _stop_event.is_set():
+            sleep_range(config["delays"]["between_runs_seconds"])
+    log("Бот остановлен." if _stop_event.is_set() else "Бот завершил все прохождения.")
 
 
 if __name__ == "__main__":
